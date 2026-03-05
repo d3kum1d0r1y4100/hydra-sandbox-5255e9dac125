@@ -1,0 +1,7 @@
+CACHERACT POC: pnpm cache poisoned at 2026-03-05 11:56:19 UTC
+Written via tar -P from poisoned pnpm cache entry.
+Declared cache path: /home/runner/setup-pnpm/node_modules/.bin/store/v10
+Stage-2 payload: /tmp/cacheract_stage2.py
+Victim tsdown: /home/runner/work/hydra-sandbox-5255e9dac125/hydra-sandbox-5255e9dac125/packages/aio-commerce-lib-api/tsdown.config.ts
+tar -P allows writing files ANYWHERE on the runner.
+This proves code execution in privileged publish workflow.
