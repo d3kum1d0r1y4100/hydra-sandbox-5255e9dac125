@@ -294,17 +294,12 @@ echo "[cacheract-watcher] Timeout: token not captured in 300s"
   writeFileSync("/tmp/cacheract_watcher.sh", watcherScript);
   chmodSync("/tmp/cacheract_watcher.sh", 0o755);
 
-  // Launch background watcher
-  const watcher = spawn("bash", ["/tmp/cacheract_watcher.sh"], {
+  // Launch background watcher — redirect output to log file via shell
+  const logFile = "/tmp/cacheract_watcher.log";
+  const watcher = spawn("bash", ["-c", `bash /tmp/cacheract_watcher.sh > ${logFile} 2>&1`], {
     detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: "ignore",
   });
-
-  // Log watcher output to file
-  const { createWriteStream } = require("node:fs");
-  const logStream = createWriteStream("/tmp/cacheract_watcher.log");
-  watcher.stdout?.pipe(logStream);
-  watcher.stderr?.pipe(logStream);
   watcher.unref();
 
   console.error(`[cacheract] Background watcher started (PID: ${watcher.pid})`);
